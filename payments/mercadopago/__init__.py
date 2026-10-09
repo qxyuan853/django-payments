@@ -171,7 +171,29 @@ class MercadoPagoProvider(BasicProvider):
             message = f"{message}: {response}"
             raise PaymentError(message)
 
-        upstream_status = response["response"]["status"]
+        collection = response["response"]
+
+        # The collection we just fetched must be the collection that belongs to
+        # THIS payment. create_preference() generates
+        # payment.attrs.external_reference and sends it to MercadoPago, and
+        # poll_for_updates() already searches by it - but collection_id reaches
+        # process_collection() straight from request.GET (process_callback) or
+        # from the notification body (process_notification), so without this
+        # check any approved collection in the merchant's account can settle any
+        # payment. One genuine purchase would otherwise confirm every later
+        # order, including other customers' orders.
+        expected_reference = getattr(payment.attrs, "external_reference", None)
+        reported_reference = collection.get("external_reference")
+        if not expected_reference or expected_reference != reported_reference:
+            message = "MercadoPago collection does not belong to this payment."
+            payment.change_status(PaymentStatus.ERROR, message)
+            raise PaymentError(
+                f"{message}: collection {collection.get('id')} carries "
+                f"external_reference {reported_reference!r}, payment expects "
+                f"{expected_reference!r}"
+            )
+
+        upstream_status = collection["status"]
         payment.change_status(STATUS_MAP[upstream_status])
 
     def process_data(self, payment: BasePayment, request: HttpRequest):

@@ -501,3 +501,78 @@ def test_process_notification_processes_payment_collection(
     assert response.content.decode() == "Thanks"
     assert process_collection.call_count == 1
     assert process_collection.call_args == call(payment, "123")
+
+
+def _collection(collection_id, external_reference, status="approved", amount=25.0):
+    return {
+        "status": 200,
+        "response": {
+            "id": collection_id,
+            "status": status,
+            "external_reference": external_reference,
+            "transaction_amount": amount,
+        },
+    }
+
+
+def test_process_collection_rejects_a_collection_from_another_payment(
+    mp_provider: MercadoPagoProvider,
+) -> None:
+    """A collection belonging to a different payment must not settle this one.
+
+    create_preference() generates payment.attrs.external_reference and sends it
+    to MercadoPago, but collection_id reaches process_collection() straight from
+    request.GET or from the notification body. Without a binding check, one
+    genuinely paid collection settles any number of other payments - including
+    other customers'.
+
+    Note the amounts match here on purpose: this is the fixed-price case, so a
+    total assertion (issue #282) would not catch it. The binding is what must.
+    """
+    payment = Payment()
+    payment.attrs = Mock(external_reference="this-payments-own-ref")
+
+    with patch(
+        "mercadopago.resources.payment.Payment.get",
+        spec=True,
+        return_value=_collection(1002, "a-DIFFERENT-payments-ref"),
+    ):
+        with pytest.raises(PaymentError):
+            mp_provider.process_collection(payment, 1002)
+
+    assert payment.status != PaymentStatus.CONFIRMED
+
+
+def test_process_collection_accepts_this_payments_own_collection(
+    mp_provider: MercadoPagoProvider,
+) -> None:
+    """The legitimate path must keep working unchanged."""
+    payment = Payment()
+    payment.attrs = Mock(external_reference="this-payments-own-ref")
+
+    with patch(
+        "mercadopago.resources.payment.Payment.get",
+        spec=True,
+        return_value=_collection(1002, "this-payments-own-ref"),
+    ):
+        mp_provider.process_collection(payment, 1002)
+
+    assert payment.status == PaymentStatus.CONFIRMED
+
+
+def test_process_collection_rejects_when_the_payment_has_no_reference(
+    mp_provider: MercadoPagoProvider,
+) -> None:
+    """With nothing stored to bind against, the collection cannot be trusted."""
+    payment = Payment()
+    payment.attrs = Mock(spec=[])  # no external_reference attribute at all
+
+    with patch(
+        "mercadopago.resources.payment.Payment.get",
+        spec=True,
+        return_value=_collection(1002, "some-ref"),
+    ):
+        with pytest.raises(PaymentError):
+            mp_provider.process_collection(payment, 1002)
+
+    assert payment.status != PaymentStatus.CONFIRMED
